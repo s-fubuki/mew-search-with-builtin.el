@@ -2,7 +2,7 @@
 ;; Copyright (C) 2018, 2019, 2020, 2021 fubuki -*- coding: utf-8-emacs; -*-
 
 ;; Author: fubuki@frill.org
-;; Version: $Revision: 1.4 $$Name:  $
+;; Version: $Revision: 1.5 $$Name:  $
 ;; Keywords: tools
 
 ;; This program is free software: you can redistribute it and/or modify
@@ -56,7 +56,7 @@
 (require 'qp)               ; quoted-printable liblary.
 (require 'multipart-decode) ; base64 quoted-printable 部分をインライン展開
 
-(defconst mew-search-with-builtin-version "$Revision: 1.4 $$Name:  $")
+(defconst mew-search-with-builtin-version "$Revision: 1.5 $$Name:  $")
 
 (defgroup mew-builtin-search nil
   "Mew Builtin Search."
@@ -131,7 +131,7 @@ BG 実行しなくても有効なので注意."
 
 (eval-and-compile
   ((lambda ()
-     (let ((vec '(thread timer opattern pattern flds filter location point))
+     (let ((vec '(thread timer opattern pattern flds filter location point start))
            (i 0))
        (dolist (s vec)
          (fset (intern (concat "mbs-vector-" (symbol-name s)))
@@ -459,7 +459,7 @@ buffer 内の KEY にマッチした文字列すべてを FACE でハイライ�
         face mbs-mode-line)
     " "))
 
-(defvar mbs-mail-files-total     nil "Mail folder file total.")
+;; (defvar mbs-mail-files-total     nil "Mail folder file total.")
 (defvar mbs-thread-table         nil "BG thread work.")
 (defvar mbs-search-location-list nil "Search location staring list work.")
 
@@ -530,19 +530,20 @@ list ならそのまま file list として処理をする.
          (thread (current-thread))
          (vector (mbs-get-thread-table thread mbs-thread-table))
          chdir result att temp)
-    (and (null mbs-thread-slice-time)
-         (message "Scan folder %s..." (mew-path-to-folder path)))
     (dolist (file files)
       (setq att (file-attributes file))
       (and (null mbs-thread-slice-time)
            (mbs-progress-message
-            all count "Scan folder %s...%d%%" (mew-path-to-folder path)))
+            all count "Scan folder %s...%d%%"
+            (mew-path-to-folder (substring (file-name-directory file) 0 -1))))
       (cond
        ((null att)
         (message "File can't open %s." file))
        ((and (car att)
              (string-equal "drwx" (substring (nth 8 att) 0 4))             
              (or prefix (not (string-match mbs-ignore-directory file))))
+        (and (null mbs-thread-slice-time)
+             (message "Scan folder %s..." (mew-path-to-folder file)))
         (aset vector (mbs-vector-location) file)
         (setq result
               (append (mew--search-virtual-with-builtin regexp file) result)))
@@ -575,15 +576,18 @@ list ならそのまま file list として処理をする.
       (write-region (point-min) (point-max) file nil 'no-msg))
     (list file (mbs-file-only-length msgs))))
 
-(defun mbs-directories-total (directories)
+(defun mbs-directories-total (directories flds)
   "DIRECTORIES 以下のアクセス可能な総ファイル数を返す.
-手早く済ませる為に `mbs-mew-message-file-name' 以外も計上されるのでメール数の概算でしかない."
+手早く済ませる為に `mbs-mew-message-file-name' 以外も計上されるのでメール数の概算でしかない.
+FLDS が non-nil なら `mbs-ignore-directory' の設定は無視される."
   (let* ((files (if (consp directories) directories
                   (directory-files directories t "[^.][^.]?\\'" 'nosort)))
          (total (length files)))
     (dolist (f files total)
-      (when (and (not (string-match mbs-ignore-directory f)) (file-accessible-directory-p f))
-        (setq total (+ (mbs-directories-total f) total))))))
+      (when (and 
+             (or flds (not (string-match mbs-ignore-directory f)))
+             (file-accessible-directory-p f))
+        (setq total (+ (mbs-directories-total f flds) total))))))
 
 ;; コマンド立ち上げ導入部の前部のインタラクティブ部と
 ;; 後部のバッファ生成部を分割して後部を BG 実行.
@@ -615,7 +619,7 @@ with a search method."
 	   (name (mew-search-get-name ent))
 	   (canon-func (mew-search-get-func-canonicalize-pattern ent))
 	   (flt-func (mew-search-get-func-filter ent))
-	   opattern pattern flds filter)
+	   opattern pattern flds filter total)
       (run-hooks 'mbs-front-hook)      
       (when (and mbs-thread-slice-time
                  (not (member mbs-lc-list global-mode-string)))
@@ -627,8 +631,7 @@ with a search method."
                       (or (mew-summary-folder-name)
                           (mew-case-folder
                            mew-case
-                           (mew-proto-inbox-folder (mew-proto mew-case))))))
-          (setq mbs-mail-files-total nil))
+                           (mew-proto-inbox-folder (mew-proto mew-case)))))))
 	(setq opattern (if flt-func
 			   (read-string (concat name " virtual pattern: "))
 			 (mew-input-pick-pattern (concat name " virtual"))))
@@ -642,30 +645,30 @@ with a search method."
 	    (setq filter (funcall flt-func))
 	    (if (string= opattern " ") (setq opattern ""))
 	    (setq opattern (concat opattern filter)))
-          (when (and mbs-thread-slice-time
-                     (null mbs-mail-files-total))
+          (when mbs-thread-slice-time
             (message "Prescan...")
-            (setq mbs-mail-files-total
-                  (mbs-directories-total
-                   (mapcar #'mew-expand-folder
-                           (or flds (list mew-folder-local)))))
-            (message "Prescan...done"))
+            (setq total (mbs-directories-total
+                         (mapcar #'mew-expand-folder
+                                 (or flds (list mew-folder-local)))
+                         flds))
+            (message "Prescan...done (%d files)" total))
           (setq mbs-thread-table
                 (cons
-                 ;;  0      1     2        3       4    5      6        7
-                 ;; [thread timer opattern pattern flds filter location point]
-                 (vector nil nil opattern pattern flds filter "+" 0)
+                 ;;  0      1     2        3       4    5      6        7     8
+                 ;; [thread timer opattern pattern flds filter location point start]
+                 (vector nil nil opattern pattern flds filter "+" 0 (current-time))
                  mbs-thread-table))
           (if (null mbs-thread-slice-time)
               (mew-summary-selection-by-search-core)
             (with-mutex (make-mutex)
               (aset (car mbs-thread-table) (mbs-vector-timer)
                     (run-at-time
-                     t mbs-thread-timer 'mbs-search-location-set opattern))
+                     t mbs-thread-timer 'mbs-search-location-set opattern total))
               (message nil)
-              (mbs-search-location-set opattern)
+              (mbs-search-location-set opattern total)
               (force-mode-line-update)
-              (make-thread 'mew-summary-selection-by-search-core))))))))
+              (make-thread
+               'mew-summary-selection-by-search-core opattern))))))))
 
 (defun mbs-get-thread-table (thread table)
   "thread の値の一致する vector を vector の束である TABLE から返す."
@@ -703,7 +706,6 @@ with a search method."
       (thread-signal (aref th (mbs-vector-thread)) 'quit nil))
      ((null thread)
       (setq mbs-thread-table         nil
-            mbs-mail-files-total     nil
             mbs-search-location-list nil)
       (setq global-mode-string (delete mbs-lc-list global-mode-string))
       (force-mode-line-update)
@@ -713,7 +715,8 @@ with a search method."
 
 (add-hook 'mew-quit-hook   'mbs-thread-cleanup)
 (add-hook 'kill-emacs-hook 'mbs-thread-cleanup)
- 
+(defvar mbs-laptime nil "*Display laptime.")
+
 (defun mew-summary-selection-by-search-core ()
   "全文検索バッファ生成部.
 オリジナルではサーチ開始前に器を用意しておくが、
@@ -750,7 +753,6 @@ BGサーチ完了後に用意するようにして不用意な操作等で誤っ
              (setq mbs-thread-table nil)
              (error "%s" ms))))))
     (mew-set '(file rttl) file-rttl)
-    (when flds (setq mbs-mail-files-total nil))
     (setq vfolder (mew-folder-to-selection opattern))
     (mew-summary-switch-to-folder vfolder (and mbs-thread-unswitch 'set-buffer))
     (mew-vinfo-set-mode 'selection)
@@ -763,6 +765,12 @@ BGサーチ完了後に用意するようにして不用意な操作等で誤っ
     (setq mew-summary-form-mark-spam nil)
     (setq dfunc `(lambda () (mew-delete-file ,file)))
     (setq opts (list "-i" file))
+    (if mbs-laptime
+        (message "%s %s...done."
+                 (aref vector (mbs-vector-pattern))
+                 (format-seconds
+                  "%hh %mm %z%ss" 
+                  (time-subtract (current-time) (aref vector (mbs-vector-start))))))
     (when mbs-thread-slice-time
       (and timer (cancel-timer timer))
       (when (null (setq mbs-search-location-list
@@ -795,15 +803,16 @@ BGサーチ完了後に用意するようにして不用意な操作等で誤っ
                str))
          lst)))
 
-(defun mbs-search-location-set (regexp)
+(defun mbs-search-location-set (regexp total)
   "REGEXP の進捗率を `mbs-search-location-list' にセット.
+TOTAL は対象になるメッセージの総数.( 旧 mbs-mail-files-total)
 既にセットされていれば最新の情報に更新する."
   (let* ((vector (mbs-get-pattern-table regexp mbs-thread-table))
          ;; (loc (aref vector (mbs-vector-location)))
          (point  (aref vector (mbs-vector-point)))
          (str    (format
                   "%d%%%%%s"
-                  (- 100 (mbs-progress mbs-mail-files-total point)) regexp))
+                  (- 100 (mbs-progress total point)) regexp))
          ;; (str      (propertize str 'help-echo loc))
          (others (mbs-delete-keyword regexp mbs-search-location-list)))
     (setq mbs-search-location-list

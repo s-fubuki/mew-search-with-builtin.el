@@ -1,6 +1,6 @@
 ;;; multipart-decode.el -- Multipart Decode.
 ;; Copyright (C) 2018, 2021 fubuki@frill.org
-;; @(#)$Revision: 1.5 $
+;; @(#)$Revision: 1.6 $$Name:  $
 
 ;; Author: fubuki@frill.org
 ;; Keywords: tools
@@ -28,25 +28,36 @@
 ;; (require 'mew-search-with-builtin)
 
 ;;; Code:
+(require 'rx)
+;; (require 'mm-uu)
 
 (defgroup multipart-decode nil
   "Multipart decode."
   :group 'mew
-  :version "27.1"
+  :version "28.0.50"
   :prefix "mpd-")
 
 (defcustom mpd-multipart-regexp
-  "^Content-Type: \\(?1:multipart/\\(?:alternative;\\|mixed;\\|related;\\|report;\\)\\).*\n?.+\n?.*boundary=\"?\\(?2:[^\"\n]+\\)\"?"
+  (rx bol "Content-Type: "
+      (group-n 1 "multipart/" (or "alternative" "mixed" "related" "report"))
+      ";"
+      (*? anychar) "boundary=" (? (syntax string-quote))
+      (group-n 2 (+? print)) (? (syntax string-quote)) eol)
   "Content-Type Multipart header."
   :type  'regexp
   :group 'multipart-decode)
 
 (defcustom mpd-text-regexp
-  "^Content-Type: \\(?1:\\(?:text\\|message\\)/\\(?:plain\\|html\\|rfc822\\)\\)\\(?:\\(?:;\\|;\n\\).*charset=\"?\\(?2:[^;\"\n]+\\)\"?\\)?"
+  (rx bol "Content-Type: "
+      (group-n 1 (or "text" "message") "/" (or "plain" "html" "rfc822"))
+      (? (and ";"
+              (*? space) "charset="
+              (? (syntax string-quote))
+              (group-n 2 (+ (not (any "\"\n;"))))
+              (? (syntax string-quote)))))
   "Content-Type Type header."
   :type  'regexp
   :group 'multipart-decode)
-
 
 (defcustom  mpd-enco-regexp
   "^Content-Transfer-Encoding: \\(?1:.+\\)$"
@@ -55,16 +66,15 @@
   :group 'multipart-decode)
 
 (defcustom mpd-decode-function-alist
-  '(("base64"           . base64-decode-string)
-    ("B"                . base64-decode-string)
-    ("quoted-printable" . quoted-printable-decode-string-silence)
-    ("Q"                . quoted-printable-decode-string-silence))
+  '(("\\<base64\\|B\\>"           . base64-decode-string)
+    ("\\<quoted-printable\\|Q\\>" . quoted-printable-decode-string-silence))
   "Decode function Symbol alist."
   :type  '(repeat (cons string function))
   :group 'multipart-decode)
 
 (defcustom mpd-regular-alist
   '((shift-jis       . shift_jis)
+    (ascii           . iso-8859-1)
     (cp-850          . cp437)
     (cp-1252         . iso-8859-1)
     (134             . gb2312)
@@ -73,134 +83,132 @@
   :type  '(repeat (cons (choice symbol number) coding-system))
   :group 'multipart-decode)
 
-;; 以下の macro の各要素の番号は `mpd-content-type' の戻り値が基準
-(defmacro mpd-type-type (contents)
-  `(elt ,contents 0))
+;; `mpd-vec-sym' のベクタ出し入れ関数生成.
+(eval-and-compile
+  (defvar mpd-vec-sym '(type boundary char enco beg end))
+  (let ((i 0))
+    (dolist (a mpd-vec-sym)
+      (let* ((sym    (intern (concat "mpd-type-" (symbol-name a))))
+             (setsym (intern (concat "mpd-type-set-" (symbol-name a)))))
+        (eval `(defmacro ,sym (vec) (list 'elt vec ,i)) t)
+        (eval `(defmacro ,setsym (vec val) (list 'aset vec ,i val)) t)
+        (setq i (1+ i))))))
 
-(defmacro mpd-type-boundary (contents)
-  `(elt ,contents 1))
+(defvar mpd-header-field-regexp
+  (rx bol (or "From: " "To: " "Subject: " "Cc: " "Reply-To: " "Return-Receipt-To: ")))
 
-(defmacro mpd-type-char (contents)
-  `(elt ,contents 2))
-
-(defmacro mpd-type-enco (contents)
-  `(elt ,contents 3))
-
-(defmacro mpd-type-beg (contents)
-  `(elt ,contents 4))
-
-(defmacro mpd-type-end (contents)
-  `(elt ,contents 5))
-
-(defmacro mpd-type-set-beg (contents val)
-  `(aset ,contents 4 ,val))
-
-(defmacro mpd-type-set-end (contents val)
-  `(aset ,contents 5 ,val))
-
-(defvar mpd-subject-list '("^From:" "^To:" "^Subject:" "^Cc:"))
-
-(defun quoted-printable-decode-string-silence (string &optional coding)
+(defsubst quoted-printable-decode-string-silence (string &optional coding)
   "\"Malformed quoted-printable text\" のエコーエリア出力を抑止. *Messages* には残る."
   (let ((inhibit-message t))
     (quoted-printable-decode-string string coding)))
 
+;;;###autoload
 (defun multipart-decode (&optional buffer)
-  "buffer の encode 部分等を展開する.
+  "BUFFER の encode 部分等をインライン展開する.
+BUFFER は壊れるので保持したい場合コピーを使う等する.
 シングルパート/マルチパート の base64 quoted-printable のプレーン text と html に対応.
 zip jpg pdf 等のバイナリは誤マッチ防止のため残さないで削除します."
   (interactive)
-  (let (boundary match)
+  (let (boundary match term)
     (save-excursion
       (with-current-buffer (or buffer (current-buffer))
         (goto-char (point-min))
-        (dolist (subj mpd-subject-list)
-          (mpd-subject-decode subj))
-        (setq boundary (and (re-search-forward mpd-multipart-regexp nil t) (match-string 2)))
+        (setq term (or (save-excursion (re-search-forward "^\n" nil t)) (point-max)))
+        ;; (mail-decode-encoded-word-region (point) term)
+        (mpd-header-field-decode)
+        (setq boundary
+              (and (re-search-forward mpd-multipart-regexp term t)
+                   (match-string 2)))
         (cond
          (boundary
           (mpd-multipart-buffer-decode boundary))
          (t
           (mpd-single-buffer-decode mpd-text-regexp)))))))
 
-(defun mpd-regular (string)
+(defsubst mpd-regular (string)
   "STRING を intern して symbol にして返し、数字文字列なら数値にして返す.
 但し連想リスト `mpd-regular-alist' に置換するシンボルが設定されていればそれを返す."
-  (let ((num (string-to-number string))
-        (sym (intern (downcase string))))
+  (let* ((string (or string "iso-8859-1"))
+         (num (string-to-number string))
+         (sym (intern (downcase string))))
     (or (cdr (assq (if (zerop num) sym num) mpd-regular-alist)) sym)))
 
 (defun mpd-content-type ()
-  "開始ポイントは \"boundary\" Search 直後に在ると想定し、
-直後に続く \"Content-Type: \" 行のパラメータをベクター(並びは返り値の通り)にして返す.
+  "開始ポイントが \"boundary\" Search 直後に在ると想定し、
+続く \"Content-Type: \" 行のパラメータをベクターにして返す.
 対応しているのは変数 `mpd-multipart-regexp' `mpd-text-regexp' `mpd-enco-regexp'
 に設定されたもの.
-終了時のポイントは \"Content-Type: \" 行の後のそれ以外の行の行頭に在る."
-  (let (type boundary char encoding beg end)
-    (catch 'break
+終了時のポイントは \"Content-Type: \" 行の後の別フィールドの行の行頭に在る."
+  (let ((vec (make-vector (length mpd-vec-sym) nil)))
+    (catch 'out
       (while (zerop (forward-line))
         (cond
          ((looking-at mpd-multipart-regexp)
-          (setq type     (match-string 1)
-                boundary (match-string 2))
+          (mpd-type-set-type vec (match-string 1))
+          (mpd-type-set-boundary vec (match-string 2))
           (goto-char (match-end 0)))
-         
          ((looking-at mpd-text-regexp)
-          (setq type   (match-string 1)
-                char (if (match-string 2)
-                         (mpd-regular (match-string 2))
-                       'utf-8))
+          (mpd-type-set-type vec (match-string 1))
+          (mpd-type-set-char vec (mpd-regular (match-string 2)))
           (goto-char (match-end 0)))
-         
          ((looking-at mpd-enco-regexp)
-          (setq encoding (downcase (match-string 1)))
+          (mpd-type-set-enco vec (downcase (match-string 1))) 
           (goto-char (match-end 0)))
-
          ((not (looking-at "^\n"))
           (end-of-line))
-         
          (t
-          (throw 'break nil)))))
-    (vector type boundary char encoding beg end)))
+          (throw 'out nil)))))
+    vec))
 
-(defun mpd-subject-decode (subject)
-  "Message buffer 内の `mpd-subject-list' の中のキーワード箇所が
-エンコードされていれば当該コードにデコードして差し替える.
-デコードすればその文字列を返し、デコードが発生しなければ NIL を返す."
-  (let (beg end string non-ascii)
+(defun mpd-header-field-decode (&optional regexp)
+  "Message buffer ヘッダ内の REGEXP にマッチする箇所が\
+エンコードされていれば当該コードにデコードし差し替える.
+REGEXP が nil なら `mpd-header-field-regexp' で指定された正規表現が使われる.
+最後に `buffer-modified-p' を実行するので
+デコードが起きバッファが壊されていれば non-nil を返し、さもなくば nil を返す."
+  (let ((regexp (or regexp mpd-header-field-regexp))
+        term beg end string non-ascii field)
     (save-excursion
-      (goto-char (point-min))
-      (when (re-search-forward subject nil t)
-        (setq beg (point))
-
-        (catch 'break
-          (while (not (eobp))
+      (save-excursion
+        (setq term (if (re-search-forward "^\n" nil t)
+                       (point-marker)
+                     (point-max-marker))))
+      (while (re-search-forward regexp term t)
+        (setq beg   (point)
+              field (match-string 0))
+        (catch 'out
+          (while (< (point) term)
             (cond
              ((eolp)
-              (forward-line))
-             ((looking-at "[ \t]+\"?=\\?\\(?1:[^?]+\\)\\?\\(?2:.\\)\\?\\(?3:[^?]+\\)\\?=\"?")
-              (let* ((code (mpd-regular (match-string 1)))
-                     (enco (match-string 2))
-                     (subj (match-string 3))
-                     (func (assoc-default (upcase enco) mpd-decode-function-alist)))
+              (forward-line)
+              (if (looking-at "[^ \t]")
+                  (throw 'out (setq string (concat string "\n")))))
+             ((looking-at "[ \t]+")
+              (when (and (not (bolp)) (not (string-equal field "Subject: ")))
+                (setq string (concat string (match-string 0))))
+              (goto-char (match-end 0)))
+             ((looking-at
+               "\"?=\\?\\(?1:.+?\\)\\?\\(?2:.\\)\\?\\(?3:.+?\\)\\?=\"?")
+              (let* ((chr (mpd-regular (match-string 1)))
+                     (enc (match-string 2))
+                     (str (match-string 3))
+                     (fun (assoc-default (upcase enc) mpd-decode-function-alist
+                                         #'string-match-p)))
                 (setq non-ascii t)
                 (setq end  (match-end 0))
                 (setq string
                       (concat
-                       string
-                       (decode-coding-string (funcall func subj) code)))
+                       string (decode-coding-string (funcall fun str) chr)))
                 (goto-char end)))
-             ((looking-at "\\(?1:[ \t]\\)\\(?2:[^ \n]+\\)")
-              (setq end  (match-end 0))
-              (setq string (concat string (match-string 1) (match-string 2)))
-              (goto-char end))
-             (t
-              (throw 'break nil)))))
-        
+             ((looking-at "\\(?1:[^ \n]+\\)")
+              (setq string (concat string (match-string 1)))
+              (goto-char (match-end 0))))))
         (when non-ascii
-          (delete-region beg (progn (goto-char end) (point)))
-          (insert " " string))
-        string))))
+          (delete-region beg (point))
+          (insert string))
+        (setq non-ascii nil
+              string    nil))
+      (buffer-modified-p))))
 
 (defun mpd-multipart-buffer-decode (boundary)
   "`multipart-decode' の実体. 再帰でループする."
@@ -217,33 +225,31 @@ zip jpg pdf 等のバイナリは誤マッチ防止のため残さないで削�
         ((mpd-type-boundary types)
          (mpd-multipart-buffer-decode (mpd-type-boundary types)))
         ((or (string-match "rfc822" (or (mpd-type-type types) ""))
-             (assoc (mpd-type-enco types) mpd-decode-function-alist))
+             (and (mpd-type-enco types)
+                  (assoc-default
+                   (mpd-type-enco types) mpd-decode-function-alist #'string-match-p)))
          (mpd-decode-body boundary types)))))))
 
 (defun mpd-single-buffer-decode (regexp) ; mpd-text-regexp
   "非マルチパートの場合のヘッダの掴み."
-  (let (type code enco)
+  (let (type chr enc term)
     (save-excursion
-      (when (re-search-forward regexp nil t)
+      (setq term (re-search-forward "^\n" nil t)))
+    (save-excursion
+      (when (re-search-forward regexp term t)
         (setq type (match-string 1))
-        (setq code
-              (if (match-string 4)
-                  (intern (downcase (match-string 4)))
-                nil)))
-
-      (unless code
+        (setq chr (mpd-regular (match-string 2))))
+      (unless chr
         (goto-char (point-min))
-        (when (re-search-forward mpd-text-regexp nil t)
-          (setq code (mpd-regular (or (match-string 2) "utf-8")))))
-
+        (when (re-search-forward mpd-text-regexp term t)
+          (setq chr (mpd-regular (match-string 2)))))
       (goto-char (point-min)) ; 順不動なので仕切り直す
-      (when (re-search-forward mpd-enco-regexp nil t)
-        (setq enco (match-string 1)))
-      
-      (when (assoc enco mpd-decode-function-alist)
+      (when (re-search-forward mpd-enco-regexp term t)
+        (setq enc (match-string 1)))
+      (when (and enc (assoc-default enc mpd-decode-function-alist #'string-match-p))
         ;; 次の関数の為にポントを本文に合わせておく
-        (if (re-search-forward "\n\n" nil t) (end-of-line 0)) 
-        (mpd-decode-body nil (vector type nil code enco nil nil))))))
+        (goto-char (1- term))
+        (mpd-decode-body nil (vector type nil chr enc nil nil))))))
 
 (defun mpd-decode-body (boundary types)
   "デコーダ本体.
@@ -257,11 +263,13 @@ Decode の必要の無いプレーンテキスト等の場合差替は発生せ�
 
 `types' の中にも `boundary' はあるが次の `boundary' や
 NIL である可能性もあるので個別になっている."
-  (let ((func (assoc-default (mpd-type-enco types) mpd-decode-function-alist))
+  (let ((func (and
+               (mpd-type-enco types)
+               (assoc-default
+                (mpd-type-enco types) mpd-decode-function-alist #'string-match-p)))
         string)
     (forward-line)
     (mpd-type-set-beg types (point))
-
     (cond
      ;; Single Part 切出しポイントゲット
      ((null boundary)
@@ -274,9 +282,7 @@ NIL である可能性もあるので個別になっている."
       (end-of-line 0))
      (t
       (goto-char (point-max))))
-
     (mpd-type-set-end types (point))
-
     ;; 差替本体 仮に関数化する場合に備えて分離しやすくしてある
     (let ((beg (mpd-type-beg types))
           (end (mpd-type-end types)))
