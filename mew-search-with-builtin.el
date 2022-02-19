@@ -1,8 +1,8 @@
-;;; mew-search-with-builtin.el -- Mew Builtin Search.
-;; Copyright (C) 2018, 2019, 2020, 2021 fubuki -*- coding: utf-8-emacs; -*-
+;;; mew-search-with-builtin.el -- Mew Builtin Search.  -*- coding: utf-8-emacs; -*-
+;; Copyright (C) 2018, 2019, 2020, 2021, 2022 fubuki
 
 ;; Author: fubuki@frill.org
-;; Version: $Revision: 1.5 $$Name:  $
+;; Version: $Revision: 1.58 $$Name:  $
 ;; Keywords: tools
 
 ;; This program is free software: you can redistribute it and/or modify
@@ -28,6 +28,10 @@
 ;; (require 'mew-search-with-builtin)
 
 ;;; Update:
+;; Sat Feb 19 08:52:09 2022
+;;  - Emacs "28.0.91", "29.0.50" だと、エラーで Mew が起動しないので回避策を入れる.
+;;  - 管理法を変えたためソース区別用の Revision が大きく変わっています.
+;; 
 ;; Sat Jan 30 08:58:12 2021
 ;;  Change: 除外フォルダ指定変数名の変更.
 ;;    `mbs-ignore-directory-list' -> `mbs-ignore-directory'.
@@ -56,7 +60,7 @@
 (require 'qp)               ; quoted-printable liblary.
 (require 'multipart-decode) ; base64 quoted-printable 部分をインライン展開
 
-(defconst mew-search-with-builtin-version "$Revision: 1.5 $$Name:  $")
+(defconst mew-search-with-builtin-version "$Revision: 1.58 $$Name:  $")
 
 (defgroup mew-builtin-search nil
   "Mew Builtin Search."
@@ -172,9 +176,12 @@ BG 実行しなくても有効なので注意."
               (define-key mew-input-map "?" nil)
               (define-key mew-input-map "\M-c"  'mbs-toggle-case-fold-search)))
 
-(define-key-after
-  (lookup-key mew-summary-mode-map [menu-bar Mew Select])
-  [pic] '("Message Search" . mew-summary-selection-by-search))
+(add-hook 'mew-summary-mode-hook
+          #'(lambda ()
+              (define-key-after
+                (or (lookup-key mew-summary-mode-map [menu-bar Mew Select])
+                    (lookup-key mew-summary-mode-map [menu-bar mew Select]))
+                [pic] '("Message Search" . mew-summary-selection-by-search))))
 
 ;; Original function wrapper part.
 
@@ -511,6 +518,7 @@ buffer 内の KEY にマッチした文字列すべてを FACE でハイライ�
           (string-to-number
            (file-name-nondirectory (file-name-sans-extension b)))))))
 
+
 (defun mew--search-virtual-with-builtin (regexp path &optional _dummy)
   "PATH の中を再帰的に降りて集めた `mbs-mew-message-file-name' から
 REGEXP にマッチする内容を持つファイルの list を \"CD:\" 付で返す.
@@ -540,7 +548,7 @@ list ならそのまま file list として処理をする.
        ((null att)
         (message "File can't open %s." file))
        ((and (car att)
-             (string-equal "drwx" (substring (nth 8 att) 0 4))             
+             (string-equal "drwx" (substring (nth 8 att) 0 4))
              (or prefix (not (string-match mbs-ignore-directory file))))
         (and (null mbs-thread-slice-time)
              (message "Scan folder %s..." (mew-path-to-folder file)))
@@ -557,6 +565,7 @@ list ならそのまま file list として処理をする.
                      nil)))
           (setq temp (cons (concat (file-name-nondirectory file)) temp)))))
       (and mbs-thread-slice-time (sleep-for mbs-thread-slice-time))
+      ;; (and mbs-thread-slice-time (progn (sleep-for mbs-thread-slice-time) (discard-input)))
       (aset vector (mbs-vector-point) (1+ (aref vector (mbs-vector-point))))
       (setq count (1- count)))
     (append (mbs-sort temp) chdir result)))
@@ -608,6 +617,7 @@ FLDS が non-nil なら `mbs-ignore-directory' の設定は無視される."
 ;;               (tooltip-mode 1)
 ;;               (or migemo-isearch-enable-p (migemo-isearch-toggle-migemo))))
 
+
 (defun mew-summary-selection-by-search-wrap (&optional ask-folder)
   "Making selection according to a specified pick pattern
 with a search method."
@@ -717,6 +727,7 @@ with a search method."
 (add-hook 'kill-emacs-hook 'mbs-thread-cleanup)
 (defvar mbs-laptime nil "*Display laptime.")
 
+
 (defun mew-summary-selection-by-search-core ()
   "全文検索バッファ生成部.
 オリジナルではサーチ開始前に器を用意しておくが、
@@ -778,6 +789,7 @@ BGサーチ完了後に用意するようにして不用意な操作等で誤っ
         (setq global-mode-string
               (delete mbs-lc-list global-mode-string))))
     (setq mbs-thread-table (mbs-thread-remove-table thread mbs-thread-table))
+    (discard-input)
     (mew-local-retrieve 'vir opts dfunc nil nil rttl)
     (and (eq 'open mbs-thread-unswitch) (display-buffer vfolder))
     (run-hooks 'mbs-after-hook)))
